@@ -11,7 +11,10 @@ use penrose::{
         },
     },
     core::{
-        bindings::{parse_keybindings_with_xmodmap, KeyEventHandler},
+        bindings::{
+            keycodes_from_xmodmap, parse_keybindings_with_xmodmap, KeyCodeMask, KeyEventHandler,
+            ModifierKey,
+        },
         layout::LayoutStack,
         Config, State, WindowManager,
     },
@@ -21,6 +24,7 @@ use penrose::{
     util,
     x::{
         atom::Atom,
+        event::XEvent,
         property::Prop,
         query::{AppName, Query},
         XConn, XConnExt,
@@ -30,6 +34,9 @@ use penrose::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing_subscriber::{self, prelude::*};
+use x11rb::connection::RequestConnection;
+use x11rb::protocol::xkb::{self, ConnectionExt};
+use x11rb::protocol::xproto::ModMask;
 
 #[derive(Debug)]
 struct PinnedApp<X: XConn> {
@@ -84,7 +91,7 @@ fn get_pinned_apps<X: XConn>() -> HashMap<&'static str, PinnedApp<X>> {
     ])
 }
 
-const TAGS: [&'static str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+const TAGS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
 
 fn raw_key_bindings() -> HashMap<String, Box<dyn KeyEventHandler<RustConn>>> {
     let mut raw_bindings = map! {
@@ -107,6 +114,13 @@ fn raw_key_bindings() -> HashMap<String, Box<dyn KeyEventHandler<RustConn>>> {
         "M-space" => spawn("dmenu_run"),
         "M-Return" => spawn("alacritty"),
         "M-A-Escape" => exit(),
+
+        "A-S-grave" => key_handler(move |_, _| Ok(())),
+        "A-grave" => key_handler(move |_, _| Ok(())),
+        "A-Tab" => key_handler(move |_, _| Ok(())),
+        "A-S-Tab" => key_handler(move |_, _| Ok(())),
+        "Alt_L" => key_handler(move |_, _| Ok(())),
+        "M-l" => spawn("xscreensaver-command --lock"),
     };
 
     for tag in &TAGS {
@@ -150,13 +164,73 @@ fn raw_key_bindings() -> HashMap<String, Box<dyn KeyEventHandler<RustConn>>> {
 struct RecentClients {
     recent_clients: Vec<Xid>,
     chronological_clients: Vec<Xid>,
-    gui_open: HashMap<String, bool>,
+    switching: bool,
 }
 
 #[derive(Debug, Clone)]
 enum Direction {
     Forward,
     Backward,
+}
+
+#[derive(Debug, Clone)]
+enum SwitchContext {
+    Workspace,
+    Global,
+}
+
+fn task_switch<X: XConn + 'static>(
+    state: &mut State<X>,
+    x: &X,
+    context: SwitchContext,
+    direction: Direction,
+) -> Result<()> {
+    let focus = state.client_set.current_client().cloned();
+    let recent_clients = state.extension_or_default::<RecentClients>();
+    let recent_clients = recent_clients.borrow();
+
+    let clients_on_workspace = match context {
+        SwitchContext::Workspace => state
+            .client_set
+            .current_workspace()
+            .clients()
+            .collect::<HashSet<_>>(),
+        SwitchContext::Global => state.client_set.clients().collect::<HashSet<_>>(),
+    };
+    let clients_on_workspace = recent_clients
+        .recent_clients
+        .iter()
+        .filter(|client| clients_on_workspace.contains(client))
+        .cloned()
+        .collect::<Vec<_>>();
+    // Shouldn't really happen, but whatever
+    if clients_on_workspace.is_empty() {
+        return Ok(());
+    }
+
+    let focused_position = focus
+        .and_then(|focus| {
+            clients_on_workspace
+                .iter()
+                .cloned()
+                .position(|ws| ws == focus)
+        })
+        .unwrap_or(0);
+
+    let new_focused_position = match direction {
+        Direction::Forward => (focused_position + 1) % clients_on_workspace.len(),
+        // Wrap around to the end if we're at the start
+        Direction::Backward if focused_position == 0 => clients_on_workspace.len() - 1,
+        // (Otherwise, keep ticking backwards)
+        Direction::Backward => focused_position - 1,
+    };
+    println!("New focused position: {new_focused_position} (was: {focused_position})");
+    state
+        .client_set
+        .focus_client(&clients_on_workspace[new_focused_position]);
+    std::mem::drop(recent_clients);
+    x.refresh(state)?;
+    Ok(())
 }
 
 fn cycle_workspace<X: XConn + 'static>(state: &mut State<X>, tag: &str) -> Result<()> {
@@ -213,7 +287,11 @@ fn move_pinned_windows<X: XConn + 'static>(client: Xid, state: &mut State<X>, x:
     Ok(())
 }
 
-fn populate_new_window<X: XConn + 'static>(client: Xid, state: &mut State<X>, x: &X) -> Result<()> {
+fn populate_new_window<X: XConn + 'static>(
+    client: Xid,
+    state: &mut State<X>,
+    _x: &X,
+) -> Result<()> {
     let recent_clients = state.extension_or_default::<RecentClients>();
     let mut recent_clients = recent_clients.borrow_mut();
     recent_clients.recent_clients.insert(0, client);
@@ -283,7 +361,7 @@ fn create_tag<X: XConn + 'static>(state: &mut State<X>, tag: &str) -> Result<()>
         .add_workspace(tag, default_layout_factory())
 }
 
-fn backfill_gaps<X: XConn + 'static>(state: &mut State<X>, x: &X) -> Result<()> {
+fn backfill_gaps<X: XConn + 'static>(state: &mut State<X>, _x: &X) -> Result<()> {
     let pinned_apps = get_pinned_apps::<X>();
     let all_workspaces = state
         .client_set
@@ -347,7 +425,7 @@ fn backfill_gaps<X: XConn + 'static>(state: &mut State<X>, x: &X) -> Result<()> 
     Ok(())
 }
 
-fn populate_windows<X: XConn + 'static>(state: &mut State<X>, x: &X) -> Result<()> {
+fn populate_windows<X: XConn + 'static>(state: &mut State<X>, _x: &X) -> Result<()> {
     let all_clients = state.client_set.clients().cloned().collect::<HashSet<_>>();
     let recent_clients = state.extension_or_default::<RecentClients>();
     let mut recent_clients = recent_clients.borrow_mut();
@@ -381,27 +459,125 @@ fn populate_windows<X: XConn + 'static>(state: &mut State<X>, x: &X) -> Result<(
             .append(&mut unknown_clients);
     }
 
-    if let Some(current_client) = state.client_set.current_client() {
-        if let Some(index) = recent_clients
-            .recent_clients
-            .iter()
-            .position(|client| current_client == client)
-        {
-            recent_clients.recent_clients.remove(index);
+    // Only commit changes if we're not switching tasks right now
+    if !recent_clients.switching {
+        if let Some(current_client) = state.client_set.current_client() {
+            if let Some(index) = recent_clients
+                .recent_clients
+                .iter()
+                .position(|client| current_client == client)
+            {
+                recent_clients.recent_clients.remove(index);
+            }
+            recent_clients.recent_clients.insert(0, *current_client);
         }
-        recent_clients.recent_clients.insert(0, *current_client);
     }
 
     Ok(())
 }
 
+lazy_static::lazy_static! {
+    static ref KEYCODES_FROM_XMODMAP: HashMap<String, u8> = keycodes_from_xmodmap().unwrap();
+}
+
+fn alt_tab_listener<X: XConn + 'static>(
+    event: &XEvent,
+    state: &mut State<X>,
+    x: &X,
+) -> Result<bool> {
+    let tab_code = *KEYCODES_FROM_XMODMAP.get("Tab").unwrap();
+    let backtick_code = *KEYCODES_FROM_XMODMAP.get("grave").unwrap();
+    // println!("Code: {event:?}");
+    let code = match event {
+        XEvent::KeyPress(code) => code,
+        XEvent::KeyRelease(code) if !code.contains(ModMask::M1) => {
+            // M1 is no longer pressed!
+            let recent_clients = state.extension_or_default::<RecentClients>();
+            let mut recent_clients = recent_clients.borrow_mut();
+            if recent_clients.switching {
+                println!("Alt released. Dropping task switching status!");
+                recent_clients.switching = false;
+                std::mem::drop(recent_clients);
+                populate_windows(state, x)?;
+            }
+            return Ok(true);
+        }
+        _ => return Ok(true),
+    };
+    println!("Alt tabbing... {code:?}! :)");
+
+    let context = match code.code {
+        code if code == tab_code => SwitchContext::Global,
+        code if code == backtick_code => SwitchContext::Workspace,
+        _ => return Ok(true),
+    };
+    let direction = match code.mask {
+        mask if mask == KeyCodeMask::from(ModifierKey::Alt) => Direction::Forward,
+        mask if mask
+            == (KeyCodeMask::from(ModifierKey::Shift) | KeyCodeMask::from(ModifierKey::Alt)) =>
+        {
+            Direction::Backward
+        }
+        _ => return Ok(true),
+    };
+
+    println!("Alt tabbing! We have {code:?} pressed!! :)");
+
+    let recent_clients = state.extension_or_default::<RecentClients>();
+    recent_clients.borrow_mut().switching = true;
+    task_switch(state, x, context, direction)?;
+
+    Ok(true)
+}
+
+fn start_xscreensaver<X: XConn + 'static>(_: &mut State<X>, _: &X) -> Result<()> {
+    util::spawn("xscreensaver")
+}
+
 fn main() -> Result<()> {
+    let _ = KEYCODES_FROM_XMODMAP.get("Tab").unwrap();
+
     tracing_subscriber::fmt()
         .with_env_filter("info")
         .finish()
         .init();
 
     let conn = RustConn::new()?;
+
+    {
+        let conn = conn.connection();
+        conn.prefetch_extension_information(xkb::X11_EXTENSION_NAME)?;
+        let xkb = conn.xkb_use_extension(1, 0)?;
+        let xkb = xkb.reply()?;
+        assert!(
+            xkb.supported,
+            "This program requires the X11 server to support the XKB extension"
+        );
+
+        // Ask the X11 server to send us XKB events.
+        // TODO: No idea what to pick here. I guess this is asking unnecessarily for too much?
+        let events = xkb::EventType::NEW_KEYBOARD_NOTIFY
+            | xkb::EventType::MAP_NOTIFY
+            | xkb::EventType::STATE_NOTIFY;
+        // TODO: No idea what to pick here. I guess this is asking unnecessarily for too much?
+        let map_parts = xkb::MapPart::KEY_TYPES
+            | xkb::MapPart::KEY_SYMS
+            | xkb::MapPart::MODIFIER_MAP
+            | xkb::MapPart::EXPLICIT_COMPONENTS
+            | xkb::MapPart::KEY_ACTIONS
+            | xkb::MapPart::KEY_BEHAVIORS
+            | xkb::MapPart::VIRTUAL_MODS
+            | xkb::MapPart::VIRTUAL_MOD_MAP;
+        conn.xkb_select_events(
+            xkb::ID::USE_CORE_KBD.into(),
+            0u8.into(),
+            events,
+            map_parts,
+            map_parts,
+            &xkb::SelectEventsAux::new(),
+        )?;
+    }
+
     let key_bindings = parse_keybindings_with_xmodmap(raw_key_bindings())?;
     let mut config = add_ewmh_hooks(Config::default());
     config.tags = TAGS.into_iter().map(String::from).collect();
@@ -410,6 +586,8 @@ fn main() -> Result<()> {
     config.compose_or_set_manage_hook(populate_new_window);
     config.compose_or_set_refresh_hook(backfill_gaps);
     config.compose_or_set_refresh_hook(populate_windows);
+    config.compose_or_set_event_hook(alt_tab_listener);
+    config.compose_or_set_startup_hook(start_xscreensaver);
     let wm = WindowManager::new(config, key_bindings, HashMap::new(), conn)?;
 
     wm.run()

@@ -139,8 +139,7 @@ checksum = "b15813163c1d831bf4a13c3610c05c0d03b39feb07f7e09fa234dac9b15aaf39"
 [[package]]
 name = "penrose"
 version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "706c5b32269d2bfd4dc58a2f872a04797d77b676d3876b7ad38dc5e364b76fbb"
+source = "git+https://github.com/Mstrodl/penrose.git#60d2835f470fa3050bfa6501e7a85b2c617dd471"
 dependencies = [
  "anymap",
  "bitflags 2.4.2",
@@ -156,8 +155,7 @@ dependencies = [
 [[package]]
 name = "penrose_keysyms"
 version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51e024b9baf5a4f93ff44e42acb8678628561c41982db641ce618d9e8e0cd173"
+source = "git+https://github.com/Mstrodl/penrose.git#60d2835f470fa3050bfa6501e7a85b2c617dd471"
 dependencies = [
  "strum",
  "strum_macros",
@@ -412,8 +410,10 @@ checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
 name = "wendy"
 version = "0.1.0"
 dependencies = [
+ "lazy_static",
  "penrose",
  "tracing-subscriber",
+ "x11rb",
 ]
 
 [[package]]
