@@ -26,7 +26,7 @@ use penrose::{
         atom::Atom,
         event::XEvent,
         property::Prop,
-        query::{AppName, Query},
+        query::{AppName, ClassName, Query},
         XConn, XConnExt,
     },
     x11rb::RustConn,
@@ -71,7 +71,7 @@ fn get_pinned_apps<X: XConn>() -> HashMap<&'static str, PinnedApp<X>> {
             "3",
             PinnedApp {
                 command: "chromium",
-                query: Box::new(AppName("chromium")),
+                query: Box::new(ClassName("Chromium")),
             },
         ),
         (
@@ -97,21 +97,8 @@ fn raw_key_bindings() -> HashMap<String, Box<dyn KeyEventHandler<RustConn>>> {
     let mut raw_bindings = map! {
         map_keys: |k: &str| k.to_string();
 
-        "M-j" => modify_with(|cs| cs.focus_down()),
-        "M-k" => modify_with(|cs| cs.focus_up()),
-        "M-S-j" => modify_with(|cs| cs.swap_down()),
-        "M-S-k" => modify_with(|cs| cs.swap_up()),
         "M-S-q" => modify_with(|cs| cs.kill_focused()),
-        "M-Tab" => modify_with(|cs| cs.toggle_tag()),
-        "M-bracketright" => modify_with(|cs| cs.next_screen()),
-        "M-bracketleft" => modify_with(|cs| cs.previous_screen()),
-        "M-grave" => modify_with(|cs| cs.next_layout()),
-        "M-S-grave" => modify_with(|cs| cs.previous_layout()),
-        "M-S-Up" => send_layout_message(|| IncMain(1)),
-        "M-S-Down" => send_layout_message(|| IncMain(-1)),
-        "M-S-Right" => send_layout_message(|| ExpandMain),
-        "M-S-Left" => send_layout_message(|| ShrinkMain),
-        "M-space" => spawn("dmenu_run"),
+        "A-space" => spawn("dmenu_run"),
         "M-Return" => spawn("alacritty"),
         "M-A-Escape" => exit(),
 
@@ -277,7 +264,10 @@ fn cycle_workspace<X: XConn + 'static>(state: &mut State<X>, tag: &str) -> Resul
 }
 
 fn move_pinned_windows<X: XConn + 'static>(client: Xid, state: &mut State<X>, x: &X) -> Result<()> {
-    println!("New window just dropped: {:?}", get_app_name(client, x));
+    println!(
+        "New window just dropped: {:?}",
+        x.get_prop(client, Atom::WmClass.as_ref()).ok().flatten()
+    );
     let tag = get_tag_for_client(client, state, x)?;
     println!("...Tag is {tag}");
     state.client_set.move_client_to_tag(&client, &tag);
@@ -383,13 +373,14 @@ fn backfill_gaps<X: XConn + 'static>(state: &mut State<X>, _x: &X) -> Result<()>
         .collect::<Vec<_>>();
 
     let current_screen_index = state.client_set.current_screen().index();
-    let current_screen_workspace_tag = state
-        .client_set
-        .current_screen()
-        .workspace
-        .tag()
-        .to_string();
     for (index, old_tag) in non_empty_workspaces.iter().enumerate() {
+        let current_screen_workspace_tag = state
+            .client_set
+            .current_screen()
+            .workspace
+            .tag()
+            .to_string();
+
         // All workspaces
         let new_tag = &all_workspaces[index];
         if new_tag != old_tag {
@@ -413,12 +404,16 @@ fn backfill_gaps<X: XConn + 'static>(state: &mut State<X>, _x: &X) -> Result<()>
             if let Some((screen, screen_tag)) = screen {
                 state.client_set.focus_screen(screen);
                 state.client_set.pull_tag_to_screen(new_tag);
-                state.client_set.focus_tag(screen_tag);
+                if screen_tag != old_tag {
+                    state.client_set.focus_tag(screen_tag);
+                }
                 if let Some(focused) = focused {
                     state.client_set.focus_client(&focused);
                 }
                 state.client_set.focus_screen(current_screen_index);
-                state.client_set.focus_tag(&current_screen_workspace_tag);
+                if &current_screen_workspace_tag != old_tag {
+                    state.client_set.focus_tag(&current_screen_workspace_tag);
+                }
             }
         }
     }
@@ -581,6 +576,7 @@ fn main() -> Result<()> {
     let key_bindings = parse_keybindings_with_xmodmap(raw_key_bindings())?;
     let mut config = add_ewmh_hooks(Config::default());
     config.tags = TAGS.into_iter().map(String::from).collect();
+    config.focus_follow_mouse = false;
     config.default_layouts = default_layout_factory();
     config.compose_or_set_manage_hook(move_pinned_windows);
     config.compose_or_set_manage_hook(populate_new_window);
